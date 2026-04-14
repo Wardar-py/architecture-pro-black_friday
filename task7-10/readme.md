@@ -235,6 +235,33 @@ rebalance_cluster()
 - Окно балансировки 00:00–06:00 – наименее нагруженный период (по статистике распродаж), чтобы миграции не влияли на пользователей.  
 - Запуск по cron каждые 15 минут – быстрее встроенного балансировщика MongoDB, что сокращает время существования «горячего» шарда.
 
+### 8.3 Zoned (Tag‑aware) шардирование для изоляции «горячих» данных
+Изоляция популярных категорий – все чанки этой категории можно разместить на выделенной группе шардов, чтобы нагрузка от них не влияла на другие категории.
+Пример настройки зон для коллекции products (если бы мы выбрали range‑шардирование по полю category)
+
+```python
+# Добавляем шарды в зоны
+client.admin.command('addShardToZone', 'shard0000', zone='zone_electronics')
+client.admin.command('addShardToZone', 'shard0001', zone='zone_books')
+client.admin.command('addShardToZone', 'shard0002', zone='zone_default')
+
+# Назначаем диапазоны категорий на зоны
+client.admin.command('updateZoneKeyRange', 'somedb.products',
+    min={'category': 'Electronics', 'product_id': MinKey},
+    max={'category': 'Electronics', 'product_id': MaxKey},
+    zone='zone_electronics')
+
+client.admin.command('updateZoneKeyRange', 'somedb.products',
+    min={'category': 'Books', 'product_id': MinKey},
+    max={'category': 'Books', 'product_id': MaxKey},
+    zone='zone_books')
+```
+
+**Обоснование**:
+Пиковая нагрузка в московском регионе - Если шард‑ключ заказов включает geo_zone, можно зонировать по геозонам.
+Миграция данных при добавлении шардов - При добавлении шарда в зону перемещаются только чанки внутри этой зоны, не затрагивая остальные данные.
+Балансировщик перемещает чанки только внутри одной зоны. Это предотвращает ситуацию, когда «горячая» категория начинает мигрировать на другие шарды и создавать сетевой трафик в пик нагрузки.
+
 ## Задание 9. Настройка чтения с реплик и консистентность
 
 ### 9.1 Таблица операций чтения
@@ -331,13 +358,11 @@ check_replication_lag()
 
 | Сущность           |                         Причина миграции                         | Приоритет |
 |:-------------------|:----------------------------------------------------------------:|----------:|
-| Заказы             |   50k запросов/сек, критичны, нужна линейная масштабируемость    |   Высокий |
 | Корзины            |             Временные данные, высокая частота записи             |   Высокий |
 | История заказов    | Аналитика, огромный объём, не требуется строгая консистентность  |   Средний |
 
 
 **Обоснование:**
-- Заказы: высокая нагрузка записи (до 50000 запросов/сек), требуют линейной масштабируемости и отказоустойчивости. Cassandra обеспечивает leaderless репликацию и быстрое горизонтальное масштабирование без полного перераспределения данных.
 - Корзины: временные данные с высокой частотой обновлений. Cassandra позволяет настроить TTL на уровне строки, автоматически очищая устаревшие корзины, и обеспечивает низкую задержку записи при высокой конкуренции.
 - История заказов: аналитические данные, огромные объёмы, не требуется строгая консистентность. Cassandra с TimeWindowCompactionStrategy оптимизирует хранение по времени и эффективно работает с временными рядами.
 
@@ -345,7 +370,6 @@ check_replication_lag()
 ### 10.2 Модель данных
 ```python
 from cassandra.cluster import Cluster
-from cassandra import ConsistencyLevel
 
 session = Cluster(['cassandra1', 'cassandra2', 'cassandra3']).connect()
 session.execute("""
@@ -354,39 +378,15 @@ session.execute("""
 """)
 session.set_keyspace('shop')
 
+# Тип для элемента корзины (аналогичен заказу, но без цены)
 session.execute("""
-    CREATE TYPE IF NOT EXISTS order_item (
+    CREATE TYPE IF NOT EXISTS cart_item (
         product_id text,
-        quantity int,
-        price decimal
+        quantity int
     )
 """)
 
-session.execute("""
-    CREATE TABLE IF NOT EXISTS orders_by_customer (
-        customer_id text,
-        order_date timestamp,
-        order_id uuid,
-        status text,
-        total_amount decimal,
-        geo_zone text,
-        items frozen<list<order_item>>,
-        PRIMARY KEY ((customer_id), order_date, order_id)
-    ) WITH CLUSTERING ORDER BY (order_date DESC)
-""")
-
-session.execute("""
-    CREATE TABLE IF NOT EXISTS orders_by_id (
-        order_id uuid PRIMARY KEY,
-        customer_id text,
-        order_date timestamp,
-        status text,
-        total_amount decimal,
-        geo_zone text,
-        items frozen<list<order_item>>
-    )
-""")
-
+# ===== Корзины по сессии =====
 session.execute("""
     CREATE TABLE IF NOT EXISTS carts_by_session (
         session_id text,
@@ -394,12 +394,13 @@ session.execute("""
         cart_id uuid,
         user_id text,
         status text,
-        items frozen<list<order_item>>,
+        items frozen<list<cart_item>>,
         created_at timestamp,
         PRIMARY KEY ((session_id), updated_at)
     ) WITH default_time_to_live = 86400
 """)
 
+# ===== Корзины по пользователю =====
 session.execute("""
     CREATE TABLE IF NOT EXISTS carts_by_user (
         user_id text,
@@ -407,12 +408,13 @@ session.execute("""
         cart_id uuid,
         session_id text,
         status text,
-        items frozen<list<order_item>>,
+        items frozen<list<cart_item>>,
         created_at timestamp,
         PRIMARY KEY ((user_id), updated_at)
     ) WITH default_time_to_live = 86400
 """)
 
+# ===== История заказов (аналитика) =====
 session.execute("""
     CREATE TABLE IF NOT EXISTS order_history (
         date_bucket text,
@@ -422,6 +424,7 @@ session.execute("""
         total_amount decimal,
         status text,
         geo_zone text,
+        items frozen<list<cart_item>>,   -- упрощённо, без цены
         PRIMARY KEY ((date_bucket), order_date, order_id)
     ) WITH CLUSTERING ORDER BY (order_date DESC)
       AND compaction = {
@@ -430,12 +433,10 @@ session.execute("""
           'compaction_window_unit': 'DAYS'
       }
 """)
+
 ```
 
 **Обоснование:**
-- **Таблица orders:** `PRIMARY KEY ((customer_id), order_date, order_id)`
-  - `customer_id` как partition key – все заказы одного клиента хранятся на одной ноде, что позволяет быстро получать историю заказов без cross-node запросов.
-  - `order_date` и `order_id` как кластерные ключи – сортировка по дате (DESC) для быстрого получения последних заказов.
 - **Таблица carts:** `PRIMARY KEY ((session_id), updated_at)`
   - `session_id` – partition key, так как большинство операций с корзиной выполняются по сессии гостя или пользователя.
   - `updated_at` – кластеризация по времени обновления позволяет легко удалять старые корзины через TTL и сортировать по активности.
@@ -449,89 +450,76 @@ session.execute("""
 from pymongo import MongoClient
 from cassandra.cluster import Cluster
 from cassandra.query import BatchStatement, SimpleStatement
-import uuid
 
-def migrate_orders(batch_size=100):
+def migrate_carts(batch_size=100):
     mongo_client = MongoClient('mongodb://mongos_router:27020')
-    cassandra_cluster = Cluster(['cassandra1'])
-    cassandra_session = cassandra_cluster.connect('shop')
+    cassandra_session = Cluster(['cassandra1']).connect('shop')
     
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     count = 0
     
-    orders = mongo_client.somedb.orders.find()
-    for order in orders:
+    carts = mongo_client.somedb.carts.find({'status': 'active'})
+    for cart in carts:
         query = SimpleStatement("""
-            INSERT INTO orders 
-            (customer_id, order_date, order_id, status, total_amount, geo_zone, items)
+            INSERT INTO carts_by_session 
+            (session_id, updated_at, cart_id, user_id, status, items, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
         """)
         batch.add(query, (
-            order['customer_id'],
-            order['order_date'],
-            order['order_id'],
-            order['status'],
-            order['total_amount'],
-            order['geo_zone'],
-            order['items']
+            cart['session_id'],
+            cart['updated_at'],
+            cart['_id'],
+            cart.get('user_id'),
+            cart['status'],
+            cart['items'],
+            cart['created_at']
         ))
         count += 1
         if count % batch_size == 0:
             cassandra_session.execute(batch)
             batch = BatchStatement()
-            print(f"Migrated {count} orders")
-    
     if batch:
         cassandra_session.execute(batch)
-    print(f"Migration complete: {count} orders migrated")
-
-migrate_orders()
+    print(f"Migrated {count} carts")
 ```
 
 **Обоснование:**
-- **Hinted Handoff** – включён по умолчанию для всех таблиц. При временной недоступности узла запрос сохраняется на соседнем узле (до 3 часов). Критично для корзин и истории заказов, где потеря данных недопустима, а задержка доставки допустима.
-- **Read Repair** – настроен с вероятностью 10% для таблицы orders. Заказы – бизнес-критичны, требуется высокая консистентность при чтении. Для корзин и истории вероятность read repair снижена до 1%, так как цена исправления ошибок выше выигрыша в консистентности.
-- **Anti-Entropy Repair** – запускается еженедельно для всех таблиц. Полное сканирование необходимо для синхронизации данных после длительной работы, особенно при сбоях. Частота – 7 дней, так как daily repair излишне нагружает кластер, а monthly рискованно.
+- **Hinted Handoff** – включён для всех таблиц (защита от временных отказов узлов).
+- **Read Repair** – для истории заказов вероятность 10%, для корзин и сессий – 1%.
+- **Anti-Entropy Repair** – еженедельно для истории заказов, раз в 2 недели для корзин и сессий.
+
 
 ### 10.4 Стратегии консистентности (настройка уровней)
 
 ```python
 from cassandra import ConsistencyLevel
 
-# Для заказов – QUORUM запись, QUORUM чтение
-def insert_order_quorum(order_data):
+# Корзины – ONE для скорости (потеря корзины не критична)
+def update_cart_one(session_id, items):
     query = SimpleStatement(
-        "INSERT INTO orders_by_customer (...) VALUES (...)",
-        consistency_level=ConsistencyLevel.QUORUM
-    )
-    session.execute(query)
-
-def get_order_quorum(order_id):
-    query = SimpleStatement(
-        "SELECT * FROM orders WHERE order_id = %s",
-        consistency_level=ConsistencyLevel.QUORUM
-    )
-    return session.execute(query, [order_id])
-
-# Для корзин – ONE запись, ONE чтение (скорость)
-def update_cart_one(cart_data):
-    query = SimpleStatement(
-        "UPDATE carts SET items = %s WHERE session_id = %s",
+        "UPDATE carts_by_session SET items = %s WHERE session_id = %s",
         consistency_level=ConsistencyLevel.ONE
     )
-    session.execute(query)
+    session.execute(query, [items, session_id])
 
-# Для истории – ONE запись
-def insert_history_one(history_data):
+# История заказов – QUORUM для чтения (важнее точность), ONE для записи
+def insert_order_history(history_data):
     query = SimpleStatement(
         "INSERT INTO order_history (...) VALUES (...)",
         consistency_level=ConsistencyLevel.ONE
     )
     session.execute(query)
+
+def get_order_history(customer_id):
+    query = SimpleStatement(
+        "SELECT * FROM order_history WHERE customer_id = %s",
+        consistency_level=ConsistencyLevel.QUORUM
+    )
+    return session.execute(query, [customer_id])
+
 ```
 
 **Обоснование:**
-- **Orders** – `QUORUM` для записи и чтения. Заказы должны быть строго консистентны, чтобы избежать дублирования или потери. QUORUM даёт баланс между доступностью и целостностью.
 - **Carts** – `ONE` для записи и чтения. Скорость важнее абсолютной консистенции; временная потеря корзины не критична, пользователь просто добавит товары заново.
 - **Order_history** – `ONE` для записи, `ONE` для чтения. Аналитика может пережить eventual consistency; запись не должна блокироваться даже при частичном отказе узлов.
 
